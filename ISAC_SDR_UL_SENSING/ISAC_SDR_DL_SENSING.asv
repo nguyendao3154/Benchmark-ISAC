@@ -1,0 +1,302 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% @file    ISAC_GreedySearch.m
+% @author  Nguyen Dao - RS Group - UTwente.
+% @version 1.0
+% @date    Jan 09, 2024
+% @brief   
+% @history
+% 
+%                      Revision History                                      %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Revision     Date            By              Description                         %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% 1.0.0        09-Jan-2024     Nguyen Dao          create                                %
+
+%% Some constants
+ load('array_initialization.mat');
+ Pt = 200;                           % Peak transmit power (W)
+ Nt =  32;                           % Number of array elements
+
+sUCA = antenna_geometry(Nt, 39e9);
+steervector = phased.SteeringVector('IncludeElementResponse', true, "SensorArray",sUCA);
+%% OFDM params
+OFDM = OFDM_Init();
+%% Uplink
+UL = UL_Init(steervector, fc, OFDM);
+%% Radar
+Radar = Radar_Init(steervector, fc, OFDM);
+%% Calculate steering vector
+ang_elv = linspace(0, 90, 181);       % Grid of Elevation angles
+ang_az = linspace(-180, 180, 181);       % Grid of Elevation angles
+
+sv_azimuth.UL1 = steervector(fc, [ang_az; UL.elevation(1).*ones(size(ang_az))]);
+sv_elevation.UL1 = steervector(fc, [UL.azimuth(1).*ones(size(ang_elv)); ang_elv]);
+
+sv_azimuth.UL2 = steervector(fc, [ang_az; UL.elevation(2).*ones(size(ang_az))]);
+sv_elevation.UL2 = steervector(fc, [UL.azimuth(2).*ones(size(ang_elv)); ang_elv]);
+
+sv_azimuth.Rad1 = steervector(fc, [ang_az; Radar.elevation(1).*ones(size(ang_az))]);
+sv_elevation.Rad1 = steervector(fc, [Radar.azimuth(1).*ones(size(ang_elv)); ang_elv]);
+
+sv_azimuth.Rad2 = steervector(fc, [ang_az; Radar.elevation(2).*ones(size(ang_az))]);
+sv_elevation.Rad2 = steervector(fc, [Radar.azimuth(2).*ones(size(ang_elv)); ang_elv]);
+
+%%
+sensitivity = 10;
+tic
+for gamma = 10:20
+previous_result = 0;
+VS_previous = ones(Nt,Nt,2)/Nt/4*100;
+
+ power = 0;
+        for j = 1:DL.NumUsers
+            power = power + trace(real(VC_previous(:,:,j)));
+        end
+        for m = 1:Radar.NumTgts
+            power = power + trace(real(VS_previous(:,:,m)));
+        end
+first_flag = 1;
+stop_flag = 0;
+count = 0;
+iteration = 1;
+% result(1) = compute_capacity(DL.channel, abs(v_tx), angle(v_tx));
+% while stop_flag ~= 1
+
+% gamma = 10;
+while iteration < 11
+    cvx_begin sdp
+        % cvx_solver_settings('verbose', false); % or use specific solver settings
+        % cvx_solver_settings('printlevel', 1);  % depends on solver, some solvers use 'printlevel' 
+        % [r, res] = mosekopt('minimize echo(0)', prob);
+        
+        variable VC(Nt, Nt, DL.NumUsers) complex semidefinite 
+        variable VS(Nt, Nt, Radar.NumTgts) complex semidefinite 
+        % variable phase(Nt, Nt, DL.NumUsers)
+        obj = 0;
+
+        AC_previous = sum(VC_previous,3);
+        AS_previous = sum(VS_previous,3);
+        
+        AC = sum(VC,3);
+        AS = sum(VS,3);
+
+        interference = zeros(1,DL.NumUsers);
+        B = cvx(zeros(Nt,Nt, DL.NumUsers) + 1j*eps*ones(Nt,Nt, DL.NumUsers)) ;
+        
+        for j = 1:DL.NumUsers
+            for j_prime = 1:DL.NumUsers
+                if j_prime ~= j
+                   interference(j) = interference(j) + abs(DL.channel(:,j)'*VC_previous(:,:,j_prime)*DL.channel(:,j)); 
+                        B(:,:,j) = B(:,:,j) + VC(:,:,j_prime) - VC_previous(:,:,j_prime) ;
+                end
+            end
+            interference = interference + real(DL.channel(:,j)'*AS_previous*DL.channel(:,j));
+        end
+        
+        
+        q_previous = log(interference+1e-13)/log(2);
+
+        for j = 1:DL.NumUsers
+                obj = obj + log(real(DL.channel(:,j)'*(AC+AS)*DL.channel(:,j))+1e-13)/log(2) ...
+                   - q_previous(j) - real(DL.channel(:,j)'*(B(:,:,j)+(AS-AS_previous))*DL.channel(:,j))/(2^(q_previous(j))*log(2));      
+        end
+        
+        % for j = 1:DL.NumUsers
+        %         obj = obj + log(real(DL.channel(:,j)'*A*DL.channel(:,j))+1e-13)/log(2) ...
+        %            - q_previous(j);      
+        % end
+
+        % obj = log(real(DL.channel(:,j)'*V(:,:,1)*DL.channel(:,j))+1e-13)/log(2);
+
+        power = 0;
+
+        for j = 1:DL.NumUsers
+            power = power + trace(real(VC(:,:,j)));
+        end
+
+        for m = 1:Radar.NumTgts
+            power = power + trace(real(VS(:,:,m)));
+        end
+
+        D_previous = (zeros(Nt,Nt, Radar.NumTgts));
+        D = cvx(zeros(Nt,Nt, Radar.NumTgts));
+
+        for m = 1:Radar.NumTgts
+            D_previous(:,:,m) = Interference_Plus_Noise_Radar(Radar.combined, Radar.sv, VC_previous, VS_previous, m);
+        end
+        for m = 1:Radar.NumTgts
+            D(:,:,m) = Interference_Plus_Noise_Radar(Radar.combined, Radar.sv, VC, VS, m);
+        end
+        maximize (obj)
+        ratio = db2pow(gamma);
+        subject to
+            power <= 100;
+            for j = 1:DL.NumUsers
+                real(DL.channel(:,j)'*((AC+AS)-(1+1/10)*VC(:,:,j))*DL.channel(:,j)) <=  -1e-13;
+            end
+            for m = 1:Radar.NumTgts
+                real(Radar.sv(:,m)'*inv(D_previous(:,:,m))*Radar.sv(:,m)) - real(Radar.sv(:,m)'*inv(D_previous(:,:,m))*...
+                (D(:,:,m) - D_previous(:,:,m))*inv(D_previous(:,:,m))*Radar.sv(:,m)) >= ...
+                ratio/abs(Radar.combined(m))^2*real(inv_pos(Radar.sv(:,m)'*VS(:,:,m)*Radar.sv(:,m)));
+                % real(Radar.sv(:,m)'*inv(D_previous(:,:,m))*Radar.sv(:,m)) - real(Radar.sv(:,m)'*inv(D_previous(:,:,m))*...
+                % (D(:,:,m) - D_previous(:,:,m))*inv(D_previous(:,:,m))*Radar.sv(:,m)) >= ...
+                % 10/real(Radar.combined(m)^2)*real(inv(Radar.sv(:,m)'*VS(:,:,m)*Radar.sv(:,m)));
+            end
+    cvx_end
+
+    [eigvec, eigval] = eig(VC_previous(:,:,1));
+    vc_tx(:,1) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+    
+    [eigvec, eigval] = eig(VC_previous(:,:,2));
+    vc_tx(:,2) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+    
+    [eigvec, eigval] = eig(VS_previous(:,:,1));
+    vs_tx(:,1) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+    
+    [eigvec, eigval] = eig(VS_previous(:,:,2));
+    vs_tx(:,2) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+    
+    result_SINR(1) = pow2db(DL_SINR(DL.channel, vc_tx, vs_tx, 1));
+    result_SINR(2) = pow2db(DL_SINR(DL.channel, vc_tx, vs_tx, 2));
+    result_SINR(3) = pow2db(Radar_SINR(Radar.combined, Radar.sv, vc_tx, vs_tx, 1));
+    result_SINR(4) = pow2db(Radar_SINR(Radar.combined, Radar.sv, vc_tx, vs_tx, 2));
+    result_capacity = cvx_optval;
+
+    VC_previous = VC;
+    VS_previous = VS;
+
+    % sensitivity = abs(result_capacity - previous_result);
+    % 
+    % if sensitivity < 1e-2
+    %     count = count + 1;
+    %     if count == 5
+    %         stop_flag = 1;
+    %     end
+    % else  
+    %     count = 0;            
+    % end
+  
+    % result(iteration) = result_capacity;
+    % SINR(:,iteration) = result_SINR;
+    % previous_result = result_capacity;
+    iteration = iteration + 1;
+end
+    result_SINR(1,gamma-9) = pow2db(DL_SINR(DL.channel, vc_tx, vs_tx, 1));
+    result_SINR(2,gamma-9) = pow2db(DL_SINR(DL.channel, vc_tx, vs_tx, 2));
+    result_SINR(3,gamma-9) = pow2db(Radar_SINR(Radar.combined, Radar.sv, vc_tx, vs_tx, 1));
+    result_SINR(4,gamma-9) = pow2db(Radar_SINR(Radar.combined, Radar.sv, vc_tx, vs_tx, 2));
+    best_result(gamma-9) = log(1+db2pow(result_SINR(1,gamma-9)))/log(2) + log(1+db2pow(result_SINR(2,gamma-9)))/log(2);
+end
+toc
+%%
+plot(10:19, best_result);
+ylim([0,100]);
+    xlabel('Sensing SINR')
+    ylabel('Objective value')
+%%
+plot(0:5,result, 'LineWidth',2)
+    % grid on
+    xlabel('Iteration')
+    ylabel('Objective value')
+    set(gca,'FontSize', 12)
+    ylim([0,50]);
+    xlim([0,5]);
+%%
+plot(0:9,SINR(1,:),  'LineStyle','--', 'LineWidth',2, 'Marker','o'); hold on;
+plot(0:9,SINR(2,:),  'LineStyle',':', 'LineWidth',2); hold on;
+plot(0:9,SINR(3,:), 'LineStyle','-.', 'LineWidth',2, 'Marker','o'); hold on;
+plot(0:9,SINR(4,:), 'LineStyle','-', 'LineWidth',2);
+    xlabel('Iteration')
+    ylabel('SINR (dB)')
+xlim([0,9]);
+    legend('User 1', 'User 2','Target 1', 'Target 2');
+%%
+Result_after_decompose = log(1+db2pow(SINR(1,:)))/log(2) + log(1+db2pow(SINR(2,:)))/log(2)
+plot(0:9,Result_after_decompose, 'LineStyle','--', 'LineWidth',2); hold on;
+% plot(0:6,result, 'LineWidth',2);
+    % grid on
+    xlabel('Iteration')
+    ylabel('Objective value')
+    set(gca,'FontSize', 12)
+    ylim([0,50]);
+    % xlim([0,5]);
+    legend('After decompositon', 'Before decompositon');
+%%
+% Use the eig function to find eigenvalues and eigenvectors
+[eigvec, eigval] = eig(VC_previous(:,:,1));
+vc_tx(:,1) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+
+[eigvec, eigval] = eig(VC_previous(:,:,2));
+vc_tx(:,2) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+
+[eigvec, eigval] = eig(VS_previous(:,:,1));
+vs_tx(:,1) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+
+[eigvec, eigval] = eig(VS_previous(:,:,2));
+vs_tx(:,2) = sqrt(eigval(Nt,Nt))*eigvec(:,Nt);
+
+% v_tx = v_tx*v_tx';
+%%
+for j = 1:DL.NumUsers
+    % vc_tx(:,j) = (DL.channel(:,j)'*VC(:,:,j)*DL.channel(:,j))^(-1/2)*VC(:,:,j)*DL.channel(:,j);
+end
+
+% VC_TX = 
+total_pwr = norm(vc_tx,"fro")^2 + norm(vs_tx,"fro")^2 ;
+pwr(1) = norm(vc_tx,"fro")^2 ;
+pwr(2) = norm(vs_tx,"fro")^2 ;
+result_SINR(1) = pow2db(DL_SINR(DL.channel, vc_tx, vs_tx, 1));
+result_SINR(2) = pow2db(DL_SINR(DL.channel, vc_tx, vs_tx, 2));
+result_SINR(3) = pow2db(Radar_SINR(Radar.combined, Radar.sv, vc_tx, vs_tx, 1));
+result_SINR(4) = pow2db(Radar_SINR(Radar.combined, Radar.sv, vc_tx, vs_tx, 2));
+result_capacity = compute_capacity(DL.channel, vc_tx, vs_tx);
+% result_capacity = compute_capacity(DL.channel, V);
+%%
+DL.channel(:,1)'*vc_tx(:,1)*vc_tx(:,1)'*DL.channel(:,1)
+DL.channel(:,1)'*VC_previous(:,:,1)*DL.channel(:,1)
+%%
+result_SINR(1) = pow2db(DL_SINR(DL.channel, VC, VS, 1));
+result_SINR(2) = pow2db(DL_SINR(DL.channel, VC, VS, 2));
+result_SINR(3) = pow2db(Radar_SINR(Radar.combined, Radar.sv, VC, VS, 1));
+result_SINR(4) = pow2db(Radar_SINR(Radar.combined, Radar.sv, VC, VS, 2));
+result_capacity = compute_capacity(DL.channel, VC, VS);
+   %%
+   figure;
+   % v_tx(:,1) = v_tx(:,1)/norm(v_tx(:,1));
+    for i = 1:181
+        Pattern_elv1(i) = abs(sv_elevation.DL2(:,i)'*(vc_tx(:,2)/8))^2;
+    end
+    hold on
+    grid on
+    xlabel('Elevation (deg)')
+    ylabel('(dB)')
+    % xlim([0 90])
+    % ylim([-20 20])
+    plot(ang_elv, pow2db(Pattern_elv1), 'LineWidth', 2, 'LineStyle','-.', 'Color','black')
+    set(gca,'FontSize', 13)
+    % legend('DL 1', 'DL 2', 'Sensing 1', 'Sensing 2', 'Sum TX', 'Location', 'southoutside', 'Orientation', 'horizontal')
+    % title('Beam Pattern')
+    %%
+    % csvwrite('elv_patt.csv',transpose(pow2db(Pattern_elv_ul1)));
+%% Desired DL pattern Elevation
+    for i = 1:181
+        Pattern_az1(i) = abs(sv_azimuth.DL2(:,i)'*v_tx(:,2))^2;
+    end
+
+    figure
+    hold on
+    grid on
+    xlabel('Azimuth (deg)')
+    ylabel('(dB)')
+    xlim([-180 180])
+    ylim([-20 40])
+    plot(ang_az, pow2db(Pattern_az1), 'LineWidth', 2, 'LineStyle','-.','Color','black')
+
+    set(gca,'FontSize', 13)
+    % legend('DL 1', 'DL 2', 'Sensing 1', 'Sensing 2', 'Sum TX', 'Location', 'southoutside', 'Orientation', 'horizontal')
+    % title('Beam Pattern')
+    %%
+    % csvwrite('az_patt.csv',transpose(pow2db(Pattern_az_sum_rx)));
+a = abs(DL.channel(:,1)'*V_previous(:,:,1)*DL.channel(:,1))
+
+b = abs(trace(V_previous(:,:,1)*DL.channel(:,1)*DL.channel(:,1)'))

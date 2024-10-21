@@ -1,0 +1,279 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% @file    ISAC_GreedySearch.m
+% @author  Nguyen Dao - RS Group - UTwente.
+% @version 1.0
+% @date    Jan 09, 2024
+% @brief   
+% @history
+% 
+%                      Revision History                                      %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Revision     Date            By              Description                         %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% 1.0.0        09-Jan-2024     Nguyen Dao          create                                %
+
+%% Some constants
+% rng('default');                     % Set random number generator for reproducibility
+% fc = 39e9;                          % Carrier frequency (Hz)
+% c = 3e8;                            % Speed of light
+% Pt = 200;                         % Peak transmit power (W)
+% Nt =  64;                              % Number of array elements
+% %%
+% sUCA = antenna_geometry(Nt, fc);
+% steervector = phased.SteeringVector('IncludeElementResponse', true, "SensorArray",sUCA);
+%%
+ load('initialization.mat');
+%% Some more fixed parameters
+OFDM.N = 100;              % Number of subcarriers
+OFDM.delta_f = 0.1e9;       % Carrier spacing
+OFDM.carrier_freq = fc:OFDM.delta_f:fc+OFDM.N*OFDM.delta_f;
+OFDM.lambda = c./OFDM.carrier_freq;
+% pattern(sUCA,fc,0,[0:90],'Type','powerdb','PropagationSpeed',c)
+gain = phased.ArrayGain('SensorArray',sUCA);
+g = gain(fc,[zeros(1,91);0:90])
+
+%% Downlink
+DL.NumUsers = 2;                              % Number of communication users
+DL.NumSymbols = 1;                             % Number of communication symbols
+DL.Constellation = 4;                              % QPSK
+DL.data = randi([0 DL.Constellation-1], DL.NumUsers, DL.NumSymbols);        % Binary data
+DL.S = pskmod(DL.data, DL.Constellation, pi/DL.Constellation);          % QPSK symbols
+% DL.UsersPos = [rand(1, DL.NumUsers)*15; zeros(1, DL.NumUsers)*24; rand(1, DL.NumUsers)*10];
+% DL.azimuth = atand(DL.UsersPos(1,:)./DL.UsersPos(2,:));
+% DL.elevation = atand(DL.UsersPos(3,:)./sqrt(DL.UsersPos(1,:).^2 + DL.UsersPos(2,:).^2));
+DL.range = 100*ones(1, DL.NumUsers);
+% DL.azimuth = [0];
+% DL.elevation = [70];
+DL.azimuth = [0, 120];
+DL.elevation = [80, 80]; 
+DL.UsersPos = DL.range.*[cosd(DL.elevation).*sind(DL.azimuth); cosd(DL.elevation).*cosd(DL.azimuth); sind(DL.elevation)];
+DL.sv = steervector(fc, [DL.azimuth; DL.elevation]);
+
+% Channel
+AntennaGain_default = 1;
+    DL.Pathloss = (OFDM.lambda(1)/(4*pi)*...
+        AntennaGain_default/DL.range(1))^2;
+    DL.channel = OFDM.lambda(1)/(4*pi)*...
+        AntennaGain_default./DL.range.*exp(-1j*2*pi.*DL.range./OFDM.lambda(1)).*DL.sv;
+
+%% Calculate steering vector
+ang_elv = linspace(0, 90, 181);       % Grid of Elevation angles
+ang_az = linspace(-180, 180, 181);       % Grid of Elevation angles
+
+sv_azimuth.DL1 = steervector(fc, [ang_az; DL.elevation(1).*ones(size(ang_az))]);
+sv_elevation.DL1 = steervector(fc, [DL.azimuth(1).*ones(size(ang_elv)); ang_elv]);
+
+sv_azimuth.DL2 = steervector(fc, [ang_az; DL.elevation(2).*ones(size(ang_az))]);
+sv_elevation.DL2 = steervector(fc, [DL.azimuth(2).*ones(size(ang_elv)); ang_elv]);
+
+%%
+% for i = 1:181
+%     sv_3d(:,i,:) = steervector(fc, [ang_az(i)*ones(1,181); ang_elv]);
+% end
+%% Spectral Efficiency Optimization
+H_combined_all = [DL.channel];
+precoder = H_combined_all*inv(H_combined_all'*H_combined_all);
+
+power = sqrt(norm(precoder,"fro"))^2;
+v_tx(:,1) = precoder(:,1)/power*sqrt(100);
+v_tx(:,2) = precoder(:,2)/power*sqrt(100);
+
+new_pwr = norm(v_tx,"fro")^2 ;
+%%
+for j = 1:DL.NumUsers
+    V_previous(:,:,j) = (v_tx(:,j)*v_tx(:,j)');
+    % V(:,:,j) = (v_tx(:,j)*v_tx(:,j)');
+end
+
+power_0 = 0;
+for j = 1:DL.NumUsers
+            power_0 = power_0 + trace(real(V_previous(:,:,j)));
+end
+%%
+sensitivity = 10;
+previous_result = 0;
+V_previous = zeros(Nt,Nt,2);
+first_flag = 1;
+stop_flag = 0;
+count = 0;
+iteration = 1;
+% result(1) = compute_capacity(DL.channel, abs(v_tx), angle(v_tx));
+% while stop_flag ~= 1
+while iteration < 5
+    cvx_begin 
+        % cvx_solver_settings('verbose', false); % or use specific solver settings
+        % cvx_solver_settings('printlevel', 1);  % depends on solver, some solvers use 'printlevel' 
+        % [r, res] = mosekopt('minimize echo(0)', prob);
+        
+        variable V(Nt, Nt, DL.NumUsers) complex semidefinite 
+        % variable phase(Nt, Nt, DL.NumUsers)
+        obj = 0;
+
+        A_previous = sum(V_previous,3);
+        
+        A = sum(V,3);
+
+        interference = zeros(1,DL.NumUsers);
+        B = cvx(zeros(Nt,Nt, DL.NumUsers) + 1j*eps*ones(Nt,Nt, DL.NumUsers)) ;
+        
+        for j = 1:DL.NumUsers
+            for j_prime = 1:DL.NumUsers
+                if j_prime ~= j
+                   interference(j) = interference(j) + real(DL.channel(:,j)'*V_previous(:,:,j_prime)*DL.channel(:,j)); 
+                        B(:,:,j) = B(:,:,j) + V(:,:,j_prime) - V_previous(:,:,j_prime) ;
+                end
+            end   
+        end
+
+        q_previous = log(interference+1e-13)/log(2);
+
+        for j = 1:DL.NumUsers
+                obj = obj + log(real(DL.channel(:,j)'*A*DL.channel(:,j))+1e-13)/log(2) ...
+                   - q_previous(j) - real(DL.channel(:,j)'*B(:,:,j)*DL.channel(:,j))/(2^(q_previous(j))*log(2))      
+        end
+        
+        % for j = 1:DL.NumUsers
+        %         obj = obj + log(real(DL.channel(:,j)'*A*DL.channel(:,j))+1e-13)/log(2) ...
+        %            - q_previous(j);      
+        % end
+
+        % obj = log(real(DL.channel(:,j)'*V(:,:,1)*DL.channel(:,j))+1e-13)/log(2);
+
+        power = 0;
+
+        for j = 1:DL.NumUsers
+            power = power + trace(real(V(:,:,j)));
+        end
+
+        maximize (obj)
+
+        subject to
+            power <= 100;
+            % for j = 1:DL.NumUsers
+            %     real(DL.channel(:,j)'*(A-(1+1/10)*V(:,:,j))*DL.channel(:,j)) ...
+            %     <=  -1e-13;
+            % end
+    cvx_end
+    for j = 1:DL.NumUsers
+        v_tx(:,j) = (DL.channel(:,j)'*V(:,:,j)*DL.channel(:,j))^(-1/2)*V(:,:,j)*DL.channel(:,j);
+    end
+    
+    % result_capacity = compute_capacity(DL.channel, abs(v_tx), angle(v_tx));
+    % result_capacity = compute_capacity(DL.channel, V);
+    % result_capacity = cvx_optval;
+    % V_previous = V;
+    
+    % sensitivity = abs(result_capacity - previous_result);
+    % 
+    % if sensitivity < 1e-2
+    %     count = count + 1;
+    %     if count == 5
+    %         stop_flag = 1;
+    %     end
+    % else  
+    %     count = 0;            
+    % end
+  
+    result(iteration) = result_capacity;
+
+    previous_result = result_capacity;
+    iteration = iteration + 1;
+end
+%%
+plot(result)
+    % grid on
+    xlabel('Iteration')
+    ylabel('Objective value')
+    set(gca,'FontSize', 12)
+    ylim([0,50]);
+%%
+% V(:,:,1) = ones(64,64);
+% V(:,:,2) = ones(64,64);
+%%
+for j = 1:DL.NumUsers
+    % v_tx(:,j) = (DL.channel(:,j)'*V(:,:,j)*DL.channel(:,j))^(-1/2)*V(:,:,j)*DL.channel(:,j);
+end
+new_pwr = norm(v_tx,"fro")^2 ;
+result_SINR(1) = pow2db(DL_SINR(DL.channel, abs(v_tx), angle(v_tx), 1));
+result_SINR(2) = pow2db(DL_SINR(DL.channel, abs(v_tx), angle(v_tx), 2));
+% result_SINR(1) = pow2db(DL_SINR(DL.channel, V, 1));
+% result_SINR(2) = pow2db(DL_SINR(DL.channel, V, 2));
+result_capacity = compute_capacity(DL.channel, abs(v_tx), angle(v_tx));
+% result_capacity = compute_capacity(DL.channel, V);
+%%
+% Use the eig function to find eigenvalues and eigenvectors
+[eigvec, eigval] = eig(V(:,:,1));
+v_tx(:,1) = sqrt(eigval(64,64))*eigvec(:,64);
+
+[eigvec, eigval] = eig(V(:,:,2));
+v_tx(:,2) = sqrt(eigval(64,64))*eigvec(:,64);
+% v_tx = v_tx*v_tx';
+%%
+V_psd(:,:,1) = (V(:,:,1) + V(:,:,1)') / 2; % Ensure the matrix is symmetric
+V_psd(:,:,1) = V(:,:,1) + 64 * eye(64); % Ensure it is positive definite if necessary
+V_psd(:,:,2) = (V(:,:,2) + V(:,:,2)') / 2; % Ensure the matrix is symmetric
+V_psd(:,:,2) = V(:,:,2) + 64 * eye(64); % Ensure it is positive definite if necessary
+[eigvec(:,:,1), eigval(:,:,1)] = eig(V_psd(:,:,1));
+[eigvec(:,:,2), eigval(:,:,2)] = eig(V_psd(:,:,2));
+num_samples = 1000;
+random_vectors = zeros(64, 2, num_samples);
+
+% Generate random vectors from the Gaussian distribution
+for i = 1:num_samples
+    z = randn(64, 2); % Generate a standard normal random vector
+    random_vectors(:, 1, i) = (eigvec(:,:,1) * sqrt(eigval(:,:,1)) * z(:,1))'; % Transform the vector
+    random_vectors(:, 2, i) = (eigvec(:,:,2) * sqrt(eigval(:,:,2)) * z(:,2))'; % Transform the vector
+end
+for i = 1:num_samples
+    random_vectors(:, 1, i) = random_vectors(:, 1, i) / norm(random_vectors(:, 1, i));
+    random_vectors(:, 2, i) = random_vectors(:, 2, i) / norm(random_vectors(:, 2, i));
+end
+
+for i = 1:num_samples
+    objective_values(i) = compute_capacity(DL.channel, abs(random_vectors(:,:,i)), angle(random_vectors(:,:,i))); % Example objective function
+end
+[best_OBJ, best_index] = max(objective_values);
+best_solution = random_vectors(:, best_index);
+
+result_SINR(1) = pow2db(DL_SINR(DL.channel, abs(random_vectors(:,:,best_index)), angle(random_vectors(:,:,best_index)), 1));
+result_SINR(2) = pow2db(DL_SINR(DL.channel, abs(random_vectors(:,:,best_index)), angle(random_vectors(:,:,best_index)), 2));
+   %%
+   figure;
+   % v_tx(:,1) = v_tx(:,1)/norm(v_tx(:,1));
+    for i = 1:181
+        Pattern_elv1(i) = abs(sv_elevation.DL1(:,i)'*(v_tx(:,1)/8))^2;
+    end
+    hold on
+    grid on
+    xlabel('Elevation (deg)')
+    ylabel('(dB)')
+    % xlim([0 90])
+    % ylim([-20 20])
+    plot(ang_elv, pow2db(Pattern_elv1), 'LineWidth', 2, 'LineStyle','-.', 'Color','black')
+    set(gca,'FontSize', 13)
+    % legend('DL 1', 'DL 2', 'Sensing 1', 'Sensing 2', 'Sum TX', 'Location', 'southoutside', 'Orientation', 'horizontal')
+    % title('Beam Pattern')
+    %%
+    % csvwrite('elv_patt.csv',transpose(pow2db(Pattern_elv_ul1)));
+%% Desired DL pattern Elevation
+    for i = 1:181
+        Pattern_az1(i) = abs(sv_azimuth.DL2(:,i)'*v_tx(:,2))^2;
+    end
+
+    figure
+    hold on
+    grid on
+    xlabel('Azimuth (deg)')
+    ylabel('(dB)')
+    xlim([-180 180])
+    ylim([-20 40])
+    plot(ang_az, pow2db(Pattern_az1), 'LineWidth', 2, 'LineStyle','-.','Color','black')
+
+    set(gca,'FontSize', 13)
+    % legend('DL 1', 'DL 2', 'Sensing 1', 'Sensing 2', 'Sum TX', 'Location', 'southoutside', 'Orientation', 'horizontal')
+    % title('Beam Pattern')
+    %%
+    % csvwrite('az_patt.csv',transpose(pow2db(Pattern_az_sum_rx)));
+a = abs(DL.channel(:,1)'*V_previous(:,:,1)*DL.channel(:,1))
+
+b = abs(trace(V_previous(:,:,1)*DL.channel(:,1)*DL.channel(:,1)'))
